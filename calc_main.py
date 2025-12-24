@@ -28,7 +28,25 @@ def start_calc(spreadsheet, question, seats):
 	print("finished applying map")
 	# | | | | | Got Base Ballots | | | | |
 
-	vote = c.Vote(ballots, seats)
+	#Calculating averages and positions from each candidate
+	averages = {}
+	positions = {}
+	for candidate in ballots.columns:
+			ranks = ballots[candidate][ballots[candidate] > 0]
+			if len(ranks) > 0:
+				averages[candidate] = ranks.mean()
+			else:
+				averages[candidate] = 6767
+
+			positions[candidate] = [len(ballots.columns)]
+			for pos in range(1,  len(ballots.columns) + 1):
+				positions[candidate].append((ballots[candidate] == pos).sum())
+	print("finished calculating averages")
+
+
+
+
+	vote = c.Vote(ballots, seats, averages, positions)
 
 	response = "success"
 	while response == "success":

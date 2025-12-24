@@ -12,9 +12,11 @@ class RandLog:
 
 
 class Vote:
-	def __init__(self, ballots: pd.DataFrame, seats):
+	def __init__(self, ballots: pd.DataFrame, seats, averages, positions):
 		self.seats = seats
 		self._original_expired: int = 0
+		self.averages = averages
+		self.positions = positions
 
 		# init-ing weight and support columns
 		for column in ballots.columns:
@@ -26,7 +28,7 @@ class Vote:
 		ballots["Weight"] = [1] * len(ballots["Supports"])
 
 		self._original_ballots: pd.DataFrame = t.deepcopy(ballots)
-		self.quota = floor((len(ballots) / (self.seats + 1)) + 1)
+		self.quota = floor(len(ballots)) / self.seats
 		self.tabulation_rounds: list[TabulationRound] = []
 
 	def get_original_ballots(self) -> pd.DataFrame:
@@ -111,42 +113,40 @@ class TabulationRound:
 		return self._starting_vote_count.keys()
 
 	def election_round(self):
-		# get people with sufficient votes
-		people = []
-		elected_num = len(self.parent_vote.get_all_elected())
-		for person in pd.Series(data = self._starting_vote_count).sort_values(ascending = False).keys():
-			if self._starting_vote_count[person] >= self.parent_vote.quota:
-				if elected_num + len(people) >= self.parent_vote.seats and self._starting_vote_count[person] != self._starting_vote_count[people[-1]]:
-					break
-				people.append(person)
+		sorted_candidates = pd.Series(data=self._starting_vote_count).sort_values(ascending=False).keys()
+		winner = sorted_candidates[0]
 
-		# elect 1
-		if elected_num + len(people) > self.parent_vote.seats:
-			actual = []
-			while elected_num + len(actual) < self.parent_vote.seats:
-				person = t.choice(people)
-				self.random_log.append(RandLog(people, person, "elect"))
-				people.remove(person)
-				actual.append(person)
-			self.elected += actual
-			people = actual
-		else:
-			self.elected += people
+		# We check if the person with the most votes is tied with someone else. If they are, we pick best avg, most 1st choice, etc to distribute before
+		most_votes = [candidate for candidate in sorted_candidates if self._starting_vote_count[candidate] == self._starting_vote_count[winner]]
+		if len(most_votes) > 1:
+			tied_candidates = [candidate for candidate in sorted_candidates if self.parent_vote.averages[candidate] == self.parent_vote.averages[winner]]
+			min_avg = min(self.parent_vote.averages[candidate] for candidate in tied_candidates)
+			tied_candidates = [candidate for candidate in tied_candidates if self.parent_vote.averages[candidate] == min_avg]
+			if len(tied_candidates) > 1:
+				# Most 1st choice votes, 2nd, etc
+				len_pos = len(self.parent_vote.positions[tied_candidates[0]])
+				for post in range(len_pos):
+					max_vote = max(self.parent_vote.positions[candidate] for candidate in tied_candidates)
+					people = [candidate for candidate in tied_candidates if self.parent_vote.positions[candidate] == max_vote]
+					if len(people) == 1:
+						break
+			winner = tied_candidates[0]
+
+		max_votes = max(self._starting_vote_count.values())
+		self.random_log.append(RandLog([winner], winner, "elect"))
+		self.elected.append(winner)
 
 		# make surplus adjustments
-		surplus_people = []
-		for person in people:
-			if self.outgoing_ballots is None:
-				self.outgoing_ballots = self.get_starting_ballots()
+		if self.outgoing_ballots is None:
+			self.outgoing_ballots = self.get_starting_ballots()
 
-			if self._starting_vote_count[person] > self.parent_vote.quota:
-				surplus_people.append(person)
-			else:
-				self.outgoing_ballots.drop([person], axis = 1, inplace = True)
-				self.outgoing_ballots, deleted = t.remove_electee_ballots(self.outgoing_ballots, person)
-				self.expired += deleted
+		if self._starting_vote_count[winner] > self.parent_vote.quota:
+			self.surplus_calc(winner)
+		else:
+			self.outgoing_ballots.drop([winner], axis = 1, inplace = True)
+			self.outgoing_ballots, deleted = t.remove_electee_ballots(self.outgoing_ballots, winner)
+			self.expired += deleted
 
-		self.surplus_calc(surplus_people)
 
 		# recalc vote_count after all is done
 		self.outgoing_ballots, deleted = t.delete_expired(self.outgoing_ballots)
@@ -173,32 +173,74 @@ class TabulationRound:
 				people.append(person)
 
 		# eliminate
-		eliminated = t.choice(people)
 		if len(people) > 1:
-			self.random_log.append(RandLog(people, eliminated, "eliminate"))
+			#Worst average
+			max_avg = max(self.parent_vote.averages[candidate] for candidate in people)
+			people = [candidate for candidate in people if self.parent_vote.averages[candidate] == max_avg]
+			if len(people) > 1:
+				#Less 1st choice votes, 2nd, etc
+				len_pos = len(self.parent_vote.positions[people[0]])
+				for post in range(len_pos):
+					min_vote = min(self.parent_vote.positions[candidate] for candidate in people)
+					people = [candidate for candidate in people if self.parent_vote.positions[candidate] == min_vote]
+					if len(people) == 1:
+						break
+
+		eliminated = people[-1]
+		self.random_log.append(RandLog(people, eliminated, "eliminated"))
 		self.eliminated.append(eliminated)
-		self.outgoing_ballots = t.recalc_support(self._starting_ballots.drop([eliminated], axis = 1, inplace = False))
-		self.outgoing_ballots, deleted = t.delete_expired(self.outgoing_ballots)
-		self.expired += deleted
-		self.outgoing_vote_count = t.get_vote_count(self.outgoing_ballots)
 
-	def surplus_calc(self, people):
-		# personal weight
-		people_dict = dict()
-		for person in people:
-			people_dict[person] = (self._starting_vote_count[person] - self.parent_vote.quota) / self._starting_vote_count[person]
-		adjusted_ballots = t.deepcopy(self.outgoing_ballots)
+		# Calculate value per transferred ballot to transfer
+		loser_ballots = self._starting_ballots[self._starting_ballots["Supports"] == eliminated]
+		inherited_ballots = loser_ballots[loser_ballots["Weight"] < 1]
+		total_quota = inherited_ballots["Weight"].sum()
 
-		# drop person
-		adjusted_ballots.drop(people, axis = 1, inplace = True)
+		adjusted_ballots = self._starting_ballots.drop([eliminated], axis = 1, inplace = False)
+
 		adjusted_ballots, deleted = t.delete_expired(adjusted_ballots)
 		self.expired += deleted
+
+		loser_ballots = adjusted_ballots[adjusted_ballots["Supports"] == eliminated]
+		inherited_ballots = loser_ballots[loser_ballots["Weight"] < 1]
+
+		if not inherited_ballots.empty:
+			value_per_ballot = total_quota / len(inherited_ballots)
+		else:
+			value_per_ballot = 0
 
 		# adjust ballots
 		new_weights = []
 		for i, line in adjusted_ballots.iterrows():
-			if line["Supports"] in people:
-				new_weights.append(line["Weight"] * people_dict[line["Supports"]])
+			if line["Supports"] == eliminated and line["Weight"] != 1:
+				new_weights.append(value_per_ballot)
+			else:
+				new_weights.append(line["Weight"])
+		adjusted_ballots["Weight"] = new_weights
+
+		# save outcome
+		self.outgoing_ballots = adjusted_ballots
+		self.outgoing_ballots = t.recalc_support(self.outgoing_ballots)
+		self.outgoing_vote_count = t.get_vote_count(self.outgoing_ballots)
+
+	def surplus_calc(self, winner):
+		adjusted_ballots = t.deepcopy(self.outgoing_ballots)
+
+		# drop person
+		adjusted_ballots.drop([winner], axis = 1, inplace = True)
+		adjusted_ballots, deleted = t.delete_expired(adjusted_ballots)
+		self.expired += deleted
+
+		winner_ballots = adjusted_ballots[adjusted_ballots["Supports"] == winner]
+		if not winner_ballots.empty:
+			value_per_ballot = (self._starting_vote_count[winner] - self.parent_vote.quota) / len(winner_ballots)
+		else:
+			value_per_ballot = 0
+
+		# adjust ballots
+		new_weights = []
+		for i, line in adjusted_ballots.iterrows():
+			if line["Supports"] == winner:
+				new_weights.append(value_per_ballot)
 			else:
 				new_weights.append(line["Weight"])
 		adjusted_ballots["Weight"] = new_weights
